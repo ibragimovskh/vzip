@@ -1,0 +1,17 @@
+{
+  "files.associations": {
+    "__bit_reference": "c",
+    "__mutex_base": "c",
+    "__split_buffer": "c",
+    "algorithm": "c",
+    "bit": "c",
+    "bitset": "c",
+    "chrono": "c",
+    "memory": "c",
+    "string": "c",
+    "unordered_map": "c",
+    "vector": "c",
+    "__threading_support": "c",
+    "type_traits": "c"
+  }
+}
