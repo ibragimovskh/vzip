@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <dirent.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,287 +8,312 @@
 #include <time.h>
 #include <zlib.h>
 
-#define BUFFER_SIZE 1048576 // 1MB
-#define PRODUCER_THREADS_NUM 10
-#define CONSUMER_THREADS_NUM 10
-#define FILE_COUNT 100
+#define NUM_PRODUCER_THREADS 8
+#define NUM_CONSUMER_THREADS 11
 
-
-typedef struct {
-  unsigned char data[BUFFER_SIZE];
-  int nbytes;
-  char *filename;
-} buffer_t;
-buffer_t buffer_in[FILE_COUNT];
-buffer_t buffer_out[FILE_COUNT];
-
-int cmp(const void *a, const void *b) {
-  buffer_t *bufferA = (buffer_t *)a;
-  buffer_t *bufferB = (buffer_t *)b;
-  return strcmp(bufferA->filename, bufferB->filename);
-}
-
-
-int count = 0, file_idx = 0;
-int total_in = 0, total_out = 0;
+// Mutex and condition variable declarations
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t buffer_index_mutexes[FILE_COUNT];
+pthread_mutex_t linked_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t producer_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t consumer_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond_producer = PTHREAD_COND_INITIALIZER;
 pthread_cond_t cond_consumer = PTHREAD_COND_INITIALIZER;
 
+typedef struct {
+    unsigned char* data;
+    int dataSize;
+} Buffer;
 
-// Define the linked list node structure
+// Thread argument struct
+typedef struct {
+    Buffer* inputBuffer;
+    Buffer* outputBuffer;
+    pthread_mutex_t* inputBufferMutexes;
+    pthread_mutex_t* outputBufferMutexes;
+} ThreadArgs;
+
 typedef struct Node {
-    int data;
+    int indexToConsume;
     struct Node* next;
 } Node;
 
-// Function to create a new node
-Node* createNode(int data) {
-    Node* newNode = (Node*) malloc(sizeof(Node));
-    if (!newNode) {
-        printf("Error allocating memory for new node\n");
-        exit(-1);
-    }
-    newNode->data = data;
-    newNode->next = NULL;
-    return newNode;
+char** ppmSource;
+char** fileNames = NULL;
+char* fullPath = NULL;
+int fullPathLength = 0;
+Node* head = NULL;
+int fileIndex = 0;
+int totalInputSize = 0, totalOutputSize = 0;
+int bufferSize = 0;
+int numFiles = 0;
+int producerRegularWork = 0, producerRemainderWork = 0;
+int consumerRegularWork = 0, consumerRemainderWork = 0;
+int isFirstProducer = 1, isFirstConsumer = 1;
+
+int convertFilenameToOrder(const char* filename) {
+    int order;
+    sscanf(filename, "%d", &order);
+    return order;
 }
 
-// Function to add a node to the end of the list
-void enqueue(Node** head, int data) {
-    Node* newNode = createNode(data);
-    if (*head == NULL) {
-        *head = newNode;
-    } else {
-        Node* temp = *head;
-        while (temp->next != NULL) {
-            temp = temp->next;
-        }
-        temp->next = newNode;
-    }
+void pushNode(int indexToConsume) {
+    Node* newNode = malloc(sizeof(Node));
+    assert(newNode != NULL);
+    newNode->indexToConsume = indexToConsume;
+    newNode->next = head;
+    head = newNode;
 }
 
-// Function to remove a node from the front of the list
-int dequeue(Node** head) {
-    if (*head == NULL) {
-        printf("List is empty\n");
+int popNode() {
+    if (head == NULL) {
         return -1;
     }
-    Node* temp = *head;
-    int data = temp->data;
-    *head = (*head)->next;
+
+    int indexToConsume = head->indexToConsume;
+    Node* temp = head;
+    head = head->next;
     free(temp);
-    return data;
+    return indexToConsume;
 }
 
-char **ppm_source;
-char **files = NULL;
-// linked list for jobs
-Node* head = NULL;
+void* producerThread(void* args) {
+    ThreadArgs* threadArgs = (ThreadArgs*)args;
+    pthread_mutex_lock(&producer_mutex);
+    int workSize = isFirstProducer ? producerRemainderWork : producerRegularWork;
+    isFirstProducer = 0;
+    pthread_mutex_unlock(&producer_mutex);
 
+    for (int i = 0; i < workSize; i++) {
+        pthread_mutex_lock(&mutex);
+        while (fileIndex == numFiles) { // buffer is full
+            pthread_cond_wait(&cond_producer, &mutex);
+        }
+        // create local copies of fileIndex and count
+        int localFileIndex = fileIndex;
+        fileIndex++;
+        pthread_mutex_unlock(&mutex);
 
-void *producer(void *args) {
-  for (int i = 0; i < FILE_COUNT / PRODUCER_THREADS_NUM; i++) {
-    pthread_mutex_lock(&mutex);
-    while (count == FILE_COUNT) { // buffer is full
-      pthread_cond_wait(&cond_producer, &mutex);
+        // produce: load file
+        char tempBuffer[fullPathLength];
+        strcpy(tempBuffer, fullPath);
+        strcat(tempBuffer, fileNames[localFileIndex]);
+        FILE* inputFile = fopen(tempBuffer, "r");
+        assert(inputFile != NULL);
+
+        // add to buffer
+        int fileOrder = convertFilenameToOrder(fileNames[localFileIndex]) - 1;
+        pthread_mutex_lock(&threadArgs->inputBufferMutexes[fileOrder]);
+        threadArgs->inputBuffer[fileOrder].dataSize =
+            fread(threadArgs->inputBuffer[fileOrder].data, sizeof(unsigned char),
+                  bufferSize, inputFile);
+        fclose(inputFile);
+        pthread_mutex_unlock(&threadArgs->inputBufferMutexes[fileOrder]);
+        pthread_mutex_lock(&linked_list_mutex);
+        pushNode(fileOrder);
+        pthread_mutex_unlock(&linked_list_mutex);
+        pthread_cond_signal(&cond_consumer);
     }
-
-    // create local copies of file_idx and count
-    int local_file_idx = file_idx;
-    int local_count = count;
-    file_idx++;
-    count++;
-
-    pthread_mutex_unlock(&mutex);
-
-    // produce: load file
-    int len = strlen(ppm_source[1]) + strlen(files[local_file_idx]) + 2;
-    char *full_path = malloc(len * sizeof(char));
-    assert(full_path != NULL);
-    strcpy(full_path, ppm_source[1]);
-    strcat(full_path, "/");
-    strcat(full_path, files[local_file_idx]);
-    FILE *f_in = fopen(full_path, "r");
-    assert(f_in != NULL);
-
-    pthread_mutex_lock(&buffer_index_mutexes[local_count]);
-    
-    // add to buffer
-		
-
-    buffer_in[local_count].nbytes = fread(
-        buffer_in[local_count].data, sizeof(unsigned char), BUFFER_SIZE, f_in);
-
-		buffer_in[local_count].filename = malloc(strlen(full_path) * sizeof(char));
-   
-    if (buffer_in[local_count].filename == NULL) {
-      perror("Failed to allocate memory");
-    }
-
-    strcpy(buffer_in[local_count].filename, full_path);
-    fclose(f_in);
-    total_in += buffer_in[local_count].nbytes;
-
-		enqueue(&head, local_count);
-
-
-    pthread_mutex_unlock(&buffer_index_mutexes[local_count]);
-    
-
-    free(full_path);
-    pthread_cond_signal(&cond_consumer);
-  }
-  return NULL;
+    return NULL;
 }
 
-void *consumer(void *args) {
-  for (int i = 0; i < FILE_COUNT / CONSUMER_THREADS_NUM; i++) {
-    pthread_mutex_lock(&mutex);
-    while (count == 0) { // buffer is empty
-      pthread_cond_wait(&cond_consumer, &mutex);
+void* consumerThread(void* args) {
+    ThreadArgs* threadArgs = (ThreadArgs*)args;
+    pthread_mutex_lock(&consumer_mutex);
+    int workSize = isFirstConsumer ? consumerRemainderWork : consumerRegularWork;
+    isFirstConsumer = 0;
+    pthread_mutex_unlock(&consumer_mutex);
+    for (int i = 0; i < workSize; i++) {
+        pthread_mutex_lock(&linked_list_mutex);
+        while (head == NULL) { // buffer is empty
+            pthread_cond_wait(&cond_consumer, &linked_list_mutex);
+        }
+        int indexToConsume = popNode();
+        pthread_mutex_unlock(&linked_list_mutex);
+
+        // zip file
+        z_stream strm;
+        int ret = deflateInit(&strm, 9);
+        assert(ret == Z_OK);
+        strm.avail_in = threadArgs->inputBuffer[indexToConsume].dataSize;
+        strm.next_in = threadArgs->inputBuffer[indexToConsume].data;
+        strm.avail_out = bufferSize;
+        strm.next_out = threadArgs->outputBuffer[indexToConsume].data;
+        ret = deflate(&strm, Z_FINISH);
+        assert(ret == Z_STREAM_END);
+
+        pthread_mutex_lock(&threadArgs->outputBufferMutexes[indexToConsume]);
+        threadArgs->outputBuffer[indexToConsume].dataSize = bufferSize - strm.avail_out;
+        pthread_mutex_unlock(&threadArgs->outputBufferMutexes[indexToConsume]);
+        pthread_cond_signal(&cond_producer);
     }
-
-    // create a local copy of count
-    
-		int local_count = dequeue(&head);
-		count--;
-		
-
-
-    pthread_mutex_unlock(&mutex);
-
-    // zip file
-    z_stream strm;
-    int ret = deflateInit(&strm, 9);
-    assert(ret == Z_OK);
-    strm.avail_in = buffer_in[local_count].nbytes;
-    strm.next_in = buffer_in[local_count].data;
-    strm.avail_out = BUFFER_SIZE;
-    strm.next_out = buffer_out[local_count].data;
-
-    ret = deflate(&strm, Z_FINISH);
-    assert(ret == Z_STREAM_END);
-
-    pthread_mutex_lock(&buffer_index_mutexes[local_count]);
-    buffer_out[local_count].nbytes = BUFFER_SIZE - strm.avail_out;
-		// printf("HELLO\n");
-		// buffer_out[local_count].filename = malloc(strlen(buffer_in[local_count].filename) * sizeof(char));
-		// if (buffer_out[local_count].filename == NULL) {
-		// 	perror("Failed to allocate memory");
-		// }
-		// strcpy(buffer_out[local_count].filename, buffer_in[local_count].filename);
-    pthread_mutex_unlock(&buffer_index_mutexes[local_count]);
-    pthread_cond_signal(&cond_producer);
-  }
-  return NULL;
+    return NULL;
 }
 
-int main(int argc, char **argv) {
-  // time computation header
-  struct timespec start, end;
-  clock_gettime(CLOCK_MONOTONIC, &start);
-  // end of time computation header
+void initializeThreadArgs(ThreadArgs* threadArgs, int numFiles, int bufferSize) {
+    threadArgs->inputBuffer = malloc(numFiles * sizeof(Buffer));
+    if (threadArgs->inputBuffer == NULL) {
+        perror("Failed to allocate memory");
+        exit(1);
+    }
+    threadArgs->outputBuffer = malloc(numFiles * sizeof(Buffer));
+    if (threadArgs->outputBuffer == NULL) {
+        perror("Failed to allocate memory");
+        exit(1);
+    }
+    threadArgs->inputBufferMutexes = malloc(numFiles * sizeof(pthread_mutex_t));
+    if (threadArgs->inputBufferMutexes == NULL) {
+        perror("Failed to allocate memory");
+        exit(1);
+    }
+    threadArgs->outputBufferMutexes = malloc(numFiles * sizeof(pthread_mutex_t));
+    if (threadArgs->outputBufferMutexes == NULL) {
+        perror("Failed to allocate memory");
+        exit(1);
+    }
 
-  // do not modify the main function before this point!
+    for (int i = 0; i < numFiles; i++) {
+        threadArgs->inputBuffer[i].data = malloc(bufferSize);
+        threadArgs->outputBuffer[i].data = malloc(bufferSize);
+        threadArgs->inputBuffer[i].dataSize = 0;
+        threadArgs->outputBuffer[i].dataSize = 0;
+        pthread_mutex_init(&threadArgs->inputBufferMutexes[i], NULL);
+        pthread_mutex_init(&threadArgs->outputBufferMutexes[i], NULL);
+    }
+    assert(threadArgs->inputBufferMutexes != NULL &&
+           threadArgs->outputBufferMutexes != NULL &&
+           threadArgs->inputBuffer != NULL && threadArgs->outputBuffer != NULL);
+}
 
-  assert(argc == 2);
-  ppm_source = argv;
+void cleanupResources(ThreadArgs* threadArgs, int numFiles) {
+    for (int i = 0; i < numFiles; i++) {
+        free(threadArgs->inputBuffer[i].data);
+        free(threadArgs->outputBuffer[i].data);
+    }
+    free(threadArgs->inputBuffer);
+    free(threadArgs->outputBuffer);
+    free(threadArgs->inputBufferMutexes);
+    free(threadArgs->outputBufferMutexes);
+    free(fullPath);
+    for (int i = 0; i < numFiles; i++)
+        free(fileNames[i]);
+    free(fileNames);
+}
 
-  DIR *d;
-  struct dirent *dir;
-  int nfiles = 0;
+int getFileSize() {
+    int len = strlen(ppmSource[1]) + strlen(fileNames[0]) + 2;
+    char* fullPath = malloc(len * sizeof(char));
+    assert(fullPath != NULL);
+    strcpy(fullPath, ppmSource[1]);
+    strcat(fullPath, "/");
+    strcat(fullPath, fileNames[0]);
+    FILE* file = fopen(fullPath, "r");
+    assert(file != NULL);
+    fseek(file, 0, SEEK_END);
+    int size = ftell(file);
+    fclose(file);
+    return size;
+}
 
-  d = opendir(argv[1]);
-  if (d == NULL) {
-    printf("An error has occurred\n");
+int main(int argc, char** argv) {
+    // time computation header
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    // end of time computation header
+
+    // do not modify the main function before this point!
+
+    assert(argc == 2);
+    ppmSource = argv;
+
+    DIR* dir;
+    struct dirent* dirEntry;
+
+    dir = opendir(argv[1]);
+    if (dir == NULL) {
+        printf("An error has occurred\n");
+        return 0;
+    }
+
+    // create list of PPM files
+    while ((dirEntry = readdir(dir)) != NULL) {
+        fileNames = realloc(fileNames, (numFiles + 1) * sizeof(char*));
+        assert(fileNames != NULL);
+
+        int len = strlen(dirEntry->d_name);
+        if (dirEntry->d_name[len - 4] == '.' && dirEntry->d_name[len - 3] == 'p' &&
+            dirEntry->d_name[len - 2] == 'p' && dirEntry->d_name[len - 1] == 'm') {
+            fileNames[numFiles] = strdup(dirEntry->d_name);
+            assert(fileNames[numFiles] != NULL);
+
+            numFiles++;
+        }
+    }
+    closedir(dir);
+    FILE* outputFile = fopen("video.vzip", "w");
+    assert(outputFile != NULL);
+
+    bufferSize = getFileSize();
+    totalInputSize = numFiles * bufferSize;
+    producerRegularWork = (int)ceil((double)numFiles / NUM_PRODUCER_THREADS);
+    producerRemainderWork = numFiles - (producerRegularWork * (NUM_PRODUCER_THREADS - 1));
+    consumerRegularWork = (int)ceil((double)numFiles / NUM_CONSUMER_THREADS);
+    consumerRemainderWork = numFiles - (consumerRegularWork * (NUM_CONSUMER_THREADS - 1));
+
+    fullPathLength = strlen(ppmSource[1]) + strlen(fileNames[0]) + 2;
+    fullPath = (char*)malloc(fullPathLength * sizeof(char));
+    assert(fullPath != NULL);
+    strcpy(fullPath, ppmSource[1]);
+    strcat(fullPath, "/");
+
+    // create producer and consumer threads
+    pthread_t producerThreads[NUM_PRODUCER_THREADS];
+    pthread_t consumerThreads[NUM_CONSUMER_THREADS];
+
+    ThreadArgs threadArgs;
+    initializeThreadArgs(&threadArgs, numFiles, bufferSize);
+
+    for (int i = 0; i < NUM_PRODUCER_THREADS; i++) {
+        if (pthread_create(&producerThreads[i], NULL, producerThread, (void*)&threadArgs) != 0) {
+            perror("Failed to create producer thread");
+        }
+    }
+    for (int i = 0; i < NUM_CONSUMER_THREADS; i++) {
+        if (pthread_create(&consumerThreads[i], NULL, consumerThread, (void*)&threadArgs) != 0) {
+            perror("Failed to create consumer thread");
+        }
+    }
+
+    for (int i = 0; i < NUM_PRODUCER_THREADS; i++) {
+        if (pthread_join(producerThreads[i], NULL) != 0) {
+            perror("Failed to join thread");
+        }
+    }
+    for (int i = 0; i < NUM_CONSUMER_THREADS; i++) {
+        if (pthread_join(consumerThreads[i], NULL) != 0) {
+            perror("Failed to join thread");
+        }
+    }
+
+    for (int i = 0; i < numFiles; i++) {
+        fwrite(&threadArgs.outputBuffer[i].dataSize, sizeof(int), 1, outputFile);
+        fwrite(threadArgs.outputBuffer[i].data, sizeof(unsigned char),
+               threadArgs.outputBuffer[i].dataSize, outputFile);
+        totalOutputSize += threadArgs.outputBuffer[i].dataSize;
+    }
+    fclose(outputFile);
+    printf("Compression rate: %.2lf%%\n", 100.0 * (totalInputSize - totalOutputSize) / totalInputSize);
+
+    // release list of files
+    cleanupResources(&threadArgs, numFiles);
+
+    // do not modify the main function after this point!
+
+    // time computation footer
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    printf("Time: %.2f seconds\n",
+           ((double)end.tv_sec + 1.0e-9 * end.tv_nsec) -
+               ((double)start.tv_sec + 1.0e-9 * start.tv_nsec));
+    // end of time computation footer
+
     return 0;
-  }
-
-  // create list of PPM files
-  while ((dir = readdir(d)) != NULL) {
-    files = realloc(files, (nfiles + 1) * sizeof(char *));
-    assert(files != NULL);
-
-    int len = strlen(dir->d_name);
-    if (dir->d_name[len - 4] == '.' && dir->d_name[len - 3] == 'p' &&
-        dir->d_name[len - 2] == 'p' && dir->d_name[len - 1] == 'm') {
-      files[nfiles] = strdup(dir->d_name);
-      assert(files[nfiles] != NULL);
-
-      nfiles++;
-    }
-  }
-  closedir(d);
-  FILE *f_out = fopen("video.vzip", "w");
-  assert(f_out != NULL);
-
-  // create producer and consumer threads
-  pthread_t producer_threads[PRODUCER_THREADS_NUM];
-  pthread_t consumer_threads[CONSUMER_THREADS_NUM];
-
-  for (int i = 0; i < PRODUCER_THREADS_NUM; i++) {
-    if (pthread_create(&producer_threads[i], NULL, producer, NULL) != 0) {
-      perror("Failed to create producer thread");
-    }
-  }
-	
-  for (int i = 0; i < CONSUMER_THREADS_NUM; i++) {
-    if (pthread_create(&consumer_threads[i], NULL, consumer, NULL) != 0) {
-      perror("Failed to create consumer thread");
-    }
-  }
-
-  for (int i = 0; i < PRODUCER_THREADS_NUM; i++) {
-    if (pthread_join(producer_threads[i], NULL) != 0) {
-      perror("Failed to join thread");
-    }
-  }
-	
-  for (int i = 0; i < CONSUMER_THREADS_NUM; i++) {
-    if (pthread_join(consumer_threads[i], NULL) != 0) {
-      perror("Failed to join thread");
-    }
-  }
-
-
-	
-	// qsort(buffer_out, FILE_COUNT, sizeof(buffer_t), cmp);
-
-  
-	// sort'
-	for( int i = 0; i < FILE_COUNT; i++ ) {
-		printf("%d\t", i);
-		printf("buffer out: %s\n", buffer_out[i].filename);
-	}
-
-
-  for (int i = 0; i < FILE_COUNT; i++) {
-    fwrite(&buffer_out[i].nbytes, sizeof(int), 1, f_out);
-    fwrite(buffer_out[1].data, sizeof(unsigned char), buffer_out[i].nbytes,
-           f_out);
-    total_out += buffer_out[i].nbytes;
-    free(buffer_out[i].filename);
-  }
-
-  fclose(f_out);
-  printf("Compression rate: %.2lf%%\n",
-         100.0 * (total_in - total_out) / total_in);
-
-  // release list of files
-  for (int i = 0; i < nfiles; i++)
-    free(files[i]);
-  free(files);
-
-  // do not modify the main function after this point!
-
-  // time computation footer
-  clock_gettime(CLOCK_MONOTONIC, &end);
-  printf("Time: %.2f seconds\n",
-         ((double)end.tv_sec + 1.0e-9 * end.tv_nsec) -
-             ((double)start.tv_sec + 1.0e-9 * start.tv_nsec));
-  // end of time computation footer
-
-  return 0;
 }
